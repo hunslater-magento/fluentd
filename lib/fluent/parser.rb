@@ -57,8 +57,8 @@ module Fluent
         'integer' => lambda { |v| v.to_i },
         'float' => lambda { |v| v.to_f },
         'bool' => lambda { |v|
-          case v
-          when 'true', 'yes'
+          case v.downcase
+          when 'true', 'yes', '1'
             true
           else
             false
