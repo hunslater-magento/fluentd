@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -36,6 +34,14 @@ op.on('-u', '--unix PATH', "use unix socket instead of tcp") {|b|
   unix = b
 }
 
+singleton_class.module_eval do
+  define_method(:usage) do |msg|
+    puts op.to_s
+    puts "error: #{msg}" if msg
+    exit 1
+  end
+end
+
 begin
   op.parse!(ARGV)
 
@@ -54,10 +60,26 @@ else
   uri = "druby://#{host}:#{port}"
 end
 
-require 'fluent/load'
+require 'fluent/log'
+require 'fluent/env'
+require 'fluent/engine'
+require 'fluent/system_config'
+require 'serverengine'
 
-$log = Fluent::Log.new(STDERR, Fluent::Log::LEVEL_TRACE)
-Fluent::Engine.init
+include Fluent::SystemConfig::Mixin
+
+dl_opts = {}
+dl_opts[:log_level] = ServerEngine::DaemonLogger::TRACE
+logger = ServerEngine::DaemonLogger.new(STDERR, dl_opts)
+$log = Fluent::Log.new(logger)
+Fluent::Engine.init(system_config)
+
+DRb::DRbObject.class_eval do
+  undef_method :methods
+  undef_method :instance_eval
+  undef_method :instance_variables
+  undef_method :instance_variable_get
+end
 
 remote_engine = DRb::DRbObject.new_with_uri(uri)
 
@@ -70,13 +92,12 @@ include Fluent
 
 puts "Connected to #{uri}."
 puts "Usage:"
-puts "    Engine.match('some.tag').output  : get an output plugin instance"
-puts "    Engine.sources[i]                : get input plugin instances"
-puts "    Plugin.load_plugin(type,name)    : load plugin class (use this if you get DRb::DRbUnknown)"
+puts "    Fluent::Engine.root_agent.event_router.match('some.tag') : get an output plugin instance"
+puts "    Fluent::Engine.root_agent.inputs[i]                      : get input plugin instances"
+puts "    Fluent::Plugin::OUTPUT_REGISTRY.lookup(name)             : load output plugin class (use this if you get DRb::DRbUnknown)"
 puts ""
 
 Encoding.default_internal = nil if Encoding.respond_to?(:default_internal)
 
 require 'irb'
 IRB.start
-

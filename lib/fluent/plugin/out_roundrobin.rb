@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,59 +13,50 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
-module Fluent
+
+require 'fluent/plugin/multi_output'
+require 'fluent/config/error'
+
+module Fluent::Plugin
   class RoundRobinOutput < MultiOutput
-    Plugin.register_output('roundrobin', self)
+    Fluent::Plugin.register_output('roundrobin', self)
+
+    config_section :store do
+      config_param :weight, :integer, default: 1
+    end
 
     def initialize
-      @outputs = []
+      super
       @weights = []
     end
 
-    attr_reader :outputs, :weights
-    attr_accessor :rand_seed
+    attr_reader :weights
 
     def configure(conf)
-      conf.elements.select {|e|
-        e.name == 'store'
-      }.each {|e|
-        type = e['type']
-        unless type
-          raise ConfigError, "Missing 'type' parameter on <store> directive"
-        end
+      super
 
-        weight = e['weight']
-        weight = weight ? weight.to_i : 1
-        $log.debug "adding store type=#{type.dump}, weight=#{weight}"
-
-        output = Plugin.new_output(type)
-        output.configure(e)
-        @outputs << output
-        @weights << weight
-      }
+      @stores.each do |store|
+        @weights << store.weight
+      end
       @rr = -1  # starts from @output[0]
       @rand_seed = Random.new.seed
     end
 
+    def multi_workers_ready?
+      true
+    end
+
     def start
+      super
       rebuild_weight_array
-
-      @outputs.each {|o|
-        o.start
-      }
     end
 
-    def shutdown
-      @outputs.each {|o|
-        o.shutdown
-      }
+    def process(tag, es)
+      next_output.emit_events(tag, es)
     end
 
-    def emit(tag, es, chain)
-      next_output.emit(tag, es, chain)
-    end
+    private
 
-    protected
     def next_output
       @rr = 0 if (@rr += 1) >= @weight_array.size
       @weight_array[@rr]

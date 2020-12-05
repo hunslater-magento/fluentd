@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,60 +13,60 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
-module Fluent
-  class GCStatInput < Input
-    Plugin.register_input('gc_stat', self)
+
+require 'fluent/plugin/input'
+
+module Fluent::Plugin
+  class GCStatInput < Fluent::Plugin::Input
+    Fluent::Plugin.register_input('gc_stat', self)
+
+    helpers :timer
 
     def initialize
       super
+      @key_map = nil
     end
 
-    config_param :emit_interval, :time, :default => 60
+    config_param :emit_interval, :time, default: 60
+    config_param :use_symbol_keys, :bool, default: true
     config_param :tag, :string
-
-    class TimerWatcher < Coolio::TimerWatcher
-      def initialize(interval, repeat, &callback)
-        @callback = callback
-        super(interval, repeat)
-      end
-
-      def on_timer
-        @callback.call
-      rescue
-        # TODO log?
-        $log.error $!.to_s
-        $log.error_backtrace
-      end
-    end
 
     def configure(conf)
       super
+
+      unless @use_symbol_keys
+        @key_map = {}
+        GC.stat.each_key { |key|
+          @key_map[key] = key.to_s
+        }
+      end
+    end
+
+    def multi_workers_ready?
+      true
     end
 
     def start
-      @loop = Coolio::Loop.new
-      @timer = TimerWatcher.new(@emit_interval, true, &method(:on_timer))
-      @loop.attach(@timer)
-      @thread = Thread.new(&method(:run))
+      super
+
+      timer_execute(:in_gc_stat, @emit_interval, &method(:on_timer))
     end
 
     def shutdown
-      @loop.watchers.each {|w| w.detach }
-      @loop.stop
-      @thread.join
-    end
-
-    def run
-      @loop.run
-    rescue
-      $log.error "unexpected error", :error=>$!.to_s
-      $log.error_backtrace
+      super
     end
 
     def on_timer
-      now = Engine.now
+      now = Fluent::EventTime.now
       record = GC.stat
-      Engine.emit(@tag, now, record)
+      unless @use_symbol_keys
+        new_record = {}
+        record.each_pair { |k, v|
+          new_record[@key_map[k]] = v
+        }
+        record = new_record
+      end
+      router.emit(@tag, now, record)
     end
   end
 end

@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,66 +13,35 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
+
 module Fluent
-  class Match
-    def initialize(pattern_str, output)
-      patterns = pattern_str.split(/\s+/).map {|str|
-        MatchPattern.create(str)
-      }
-      if patterns.length == 1
-        @pattern = patterns[0]
-      else
-        @pattern = OrMatchPattern.new(patterns)
-      end
-      @output = output
-    end
-
-    attr_reader :output
-
-    def emit(tag, es)
-      chain = NullOutputChain.instance
-      @output.emit(tag, es, chain)
-    end
-
-    def start
-      @output.start
-    end
-
-    def shutdown
-      @output.shutdown
-    end
-
-    def match(tag)
-      if @pattern.match(tag)
-        return true
-      end
-      return false
-    end
-  end
-
-
   class MatchPattern
     def self.create(str)
-      GlobMatchPattern.new(str)
+      if str == '**'
+        AllMatchPattern.new
+      else
+        GlobMatchPattern.new(str)
+      end
     end
-
-    #def match(str)
-    #end
   end
 
-  ## TODO
-  #class RegexMatchPattern < MatchPattern
-  #  def initialize(regex)
-  #    @regex = regex
-  #  end
-  #
-  #  def match(str)
-  #    @regex.match(str) != nil
-  #  end
-  #end
+  class AllMatchPattern < MatchPattern
+    def match(str)
+      true
+    end
+  end
 
   class GlobMatchPattern < MatchPattern
     def initialize(pat)
+      if pat.start_with?('/')
+        if pat.end_with?('/')
+          @regex = Regexp.new("\\A"+pat[1..-2]+"\\Z")
+          return
+        else
+          raise Fluent::ConfigError,  "invalid match - regex"
+        end
+      end
+
       stack = []
       regex = ['']
       escape = false
@@ -167,10 +134,9 @@ module Fluent
     end
 
     def match(str)
-      @regex.match(str) != nil
+      @regex.match?(str)
     end
   end
-
 
   class OrMatchPattern < MatchPattern
     def initialize(patterns)
@@ -179,6 +145,43 @@ module Fluent
 
     def match(str)
       @patterns.any? {|pattern| pattern.match(str) }
+    end
+  end
+
+  class NoMatchMatch
+    def initialize(log)
+      @log = log
+      @count = 0
+      @warn_not_matched = true
+    end
+
+    def suppress_missing_match!
+      # for <label @FLUENT_LOG>
+      @warn_not_matched = false
+    end
+
+    def emit_events(tag, es)
+      return unless @warn_not_matched
+      # TODO use time instead of num of records
+      c = (@count += 1)
+      if c < 512
+        if Math.log(c) / Math.log(2) % 1.0 == 0
+          @log.warn "no patterns matched", tag: tag
+          return
+        end
+      else
+        if c % 512 == 0
+          @log.warn "no patterns matched", tag: tag
+          return
+        end
+      end
+      @log.on_trace { @log.trace "no patterns matched", tag: tag }
+    end
+
+    def start
+    end
+
+    def shutdown
     end
   end
 end

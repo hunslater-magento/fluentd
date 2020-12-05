@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,55 +13,33 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
-module Fluent
-  class ObjectSpaceInput < Input
-    Plugin.register_input('object_space', self)
+
+require 'yajl'
+
+require 'fluent/plugin/input'
+
+module Fluent::Plugin
+  class ObjectSpaceInput < Fluent::Plugin::Input
+    Fluent::Plugin.register_input('object_space', self)
+
+    helpers :timer
 
     def initialize
       super
     end
 
-    config_param :emit_interval, :time, :default => 60
+    config_param :emit_interval, :time, default: 60
     config_param :tag, :string
-    config_param :top, :integer, :default => 15
+    config_param :top, :integer, default: 15
 
-    class TimerWatcher < Coolio::TimerWatcher
-      def initialize(interval, repeat, &callback)
-        @callback = callback
-        super(interval, repeat)
-      end
-
-      def on_timer
-        @callback.call
-      rescue
-        # TODO log?
-        $log.error $!.to_s
-        $log.error_backtrace
-      end
-    end
-
-    def configure(conf)
-      super
+    def multi_workers_ready?
+      true
     end
 
     def start
-      @loop = Coolio::Loop.new
-      @timer = TimerWatcher.new(@emit_interval, true, &method(:on_timer))
-      @loop.attach(@timer)
-      @thread = Thread.new(&method(:run))
-    end
+      super
 
-    def shutdown
-      @loop.watchers.each {|w| w.detach }
-      @loop.stop
-      @thread.join
-    end
-
-    def run
-      @loop.run
-    rescue
-      $log.error "unexpected error", :error=>$!.to_s
-      $log.error_backtrace
+      timer_execute(:object_space_input, @emit_interval, &method(:on_timer))
     end
 
     class Counter
@@ -84,7 +60,7 @@ module Fluent
     end
 
     def on_timer
-      now = Engine.now
+      now = Fluent::EventTime.now
 
       array = []
       map = {}
@@ -108,9 +84,10 @@ module Fluent
         record[c.name] = c.count
       }
 
-      Engine.emit(@tag, now, record)
+      router.emit(@tag, now, record)
     rescue => e
-      $log.error "object space failed to emit", :error => e.to_s, :error_class => e.class.to_s, :tag => @tag, :record => Yajl.dump(record)
+      log.error "object space failed to emit", error: e, tag: @tag, record: Yajl.dump(record)
+      log.error_backtrace
     end
   end
 end

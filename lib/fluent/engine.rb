@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,335 +13,241 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
+
+require 'fluent/config'
+require 'fluent/event'
+require 'fluent/event_router'
+require 'fluent/msgpack_factory'
+require 'fluent/root_agent'
+require 'fluent/time'
+require 'fluent/system_config'
+require 'fluent/plugin'
+require 'fluent/fluent_log_event_router'
+require 'fluent/static_config_analysis'
+
 module Fluent
   class EngineClass
+    # For compat. remove it in fluentd v2
+    include Fluent::MessagePackFactory::Mixin
+
     def initialize
-      @matches = []
-      @sources = []
-      @match_cache = {}
-      @match_cache_keys = []
-      @started = []
-      @default_loop = nil
+      @root_agent = nil
+      @engine_stopped = false
+      @_worker_id = nil
 
-      @log_emit_thread = nil
-      @log_event_loop_stop = false
-      @log_event_queue = []
-
-      @suppress_emit_error_log_interval = 0
-      @next_emit_error_log_time = nil
-
+      @log_event_verbose = false
       @suppress_config_dump = false
+      @without_source = false
+
+      @fluent_log_event_router = nil
+      @system_config = SystemConfig.new
+
+      @supervisor_mode = false
     end
 
-    MATCH_CACHE_SIZE = 1024
+    MAINLOOP_SLEEP_INTERVAL = 0.3
 
-    LOG_EMIT_INTERVAL = 0.1
+    attr_reader :root_agent, :system_config, :supervisor_mode
 
-    attr_reader :matches, :sources
+    def init(system_config, supervisor_mode: false)
+      @system_config = system_config
+      @supervisor_mode = supervisor_mode
 
-    def init
-      BasicSocket.do_not_reverse_lookup = true
-      Plugin.load_plugins
-      if defined?(Encoding)
-        Encoding.default_internal = 'ASCII-8BIT' if Encoding.respond_to?(:default_internal)
-        Encoding.default_external = 'ASCII-8BIT' if Encoding.respond_to?(:default_external)
-      end
+      @suppress_config_dump = system_config.suppress_config_dump unless system_config.suppress_config_dump.nil?
+      @without_source = system_config.without_source unless system_config.without_source.nil?
+
+      @log_event_verbose = system_config.log_event_verbose unless system_config.log_event_verbose.nil?
+
+      @root_agent = RootAgent.new(log: log, system_config: @system_config)
+
       self
     end
 
-    def suppress_interval(interval_time)
-      @suppress_emit_error_log_interval = interval_time
-      @next_emit_error_log_time = Time.now.to_i
+    def log
+      $log
     end
 
-    def suppress_config_dump=(flag)
-      @suppress_config_dump = flag
+    def parse_config(io, fname, basepath = Dir.pwd, v1_config = false)
+      if fname =~ /\.rb$/
+        require 'fluent/config/dsl'
+        Config::DSL::Parser.parse(io, File.join(basepath, fname))
+      else
+        Config.parse(io, fname, basepath, v1_config)
+      end
     end
 
-    def read_config(path)
-      $log.info "reading config file", :path=>path
-      File.open(path) {|io|
-        parse_config(io, File.basename(path), File.dirname(path))
-      }
-    end
-
-    def parse_config(io, fname, basepath=Dir.pwd)
-      conf = if fname =~ /\.rb$/
-               Config::DSL::Parser.parse(io, File.join(basepath, fname))
-             else
-               Config.parse(io, fname, basepath)
-             end
+    def run_configure(conf, dry_run: false)
       configure(conf)
-      conf.check_not_fetched {|key,e|
-        $log.warn "parameter '#{key}' in #{e.to_s.strip} is not used."
-      }
+      conf.check_not_fetched do |key, e|
+        parent_name, plugin_name = e.unused_in
+        message = if parent_name && plugin_name
+                    "section <#{e.name}> is not used in <#{parent_name}> of #{plugin_name} plugin"
+                  elsif parent_name
+                    "section <#{e.name}> is not used in <#{parent_name}>"
+                  elsif e.name != 'system' && !(@without_source && e.name == 'source')
+                    "parameter '#{key}' in #{e.to_s.strip} is not used."
+                  else
+                    nil
+                  end
+        next if message.nil?
+
+        if dry_run && @supervisor_mode
+          $log.warn :supervisor, message
+        elsif e.for_every_workers?
+          $log.warn :worker0, message
+        elsif e.for_this_worker?
+          $log.warn message
+        end
+      end
     end
 
     def configure(conf)
-      # plugins / configuration dumps
-      Gem::Specification.find_all.select{|x| x.name =~ /^fluent(d|-(plugin|mixin)-.*)$/}.each do |spec|
-        $log.info "gem '#{spec.name}' version '#{spec.version}'"
+      @root_agent.configure(conf)
+
+      @fluent_log_event_router = FluentLogEventRouter.build(@root_agent)
+
+      if @fluent_log_event_router.emittable?
+        $log.enable_event(true)
       end
 
       unless @suppress_config_dump
-        $log.info "using configuration file: #{conf.to_s.rstrip}"
+        $log.info :supervisor, "using configuration file: #{conf.to_s.rstrip}"
       end
-
-      conf.elements.select {|e|
-        e.name == 'source'
-      }.each {|e|
-        type = e['type']
-        unless type
-          raise ConfigError, "Missing 'type' parameter on <source> directive"
-        end
-        $log.info "adding source type=#{type.dump}"
-
-        input = Plugin.new_input(type)
-        input.configure(e)
-
-        @sources << input
-      }
-
-      conf.elements.select {|e|
-        e.name == 'match'
-      }.each {|e|
-        type = e['type']
-        pattern = e.arg
-        unless type
-          raise ConfigError, "Missing 'type' parameter on <match #{e.arg}> directive"
-        end
-        $log.info "adding match", :pattern=>pattern, :type=>type
-
-        output = Plugin.new_output(type)
-        output.configure(e)
-
-        match = Match.new(pattern, output)
-        @matches << match
-      }
     end
 
-    def load_plugin_dir(dir)
-      Plugin.load_plugin_dir(dir)
+    def add_plugin_dir(dir)
+      $log.warn('Deprecated method: this method is going to be deleted. Use Fluent::Plugin.add_plugin_dir')
+      Plugin.add_plugin_dir(dir)
     end
 
     def emit(tag, time, record)
-      unless record.nil?
-        emit_stream tag, OneEventStream.new(time, record)
-      end
+      raise "BUG: use router.emit instead of Engine.emit"
     end
 
     def emit_array(tag, array)
-      emit_stream tag, ArrayEventStream.new(array)
+      raise "BUG: use router.emit_array instead of Engine.emit_array"
     end
 
     def emit_stream(tag, es)
-      target = @match_cache[tag]
-      unless target
-        target = match(tag) || NoMatchMatch.new
-        # this is not thread-safe but inconsistency doesn't
-        # cause serious problems while locking causes.
-        if @match_cache_keys.size >= MATCH_CACHE_SIZE
-          @match_cache_keys.delete @match_cache_keys.shift
-        end
-        @match_cache[tag] = target
-        @match_cache_keys << tag
-      end
-      target.emit(tag, es)
-    rescue => e
-      if @suppress_emit_error_log_interval == 0 || now > @next_emit_error_log_time
-        $log.warn "emit transaction failed ", :error_class=>e.class, :error=>e
-        $log.warn_backtrace
-        # $log.debug "current next_emit_error_log_time: #{Time.at(@next_emit_error_log_time)}"
-        @next_emit_error_log_time = Time.now.to_i + @suppress_emit_error_log_interval
-        # $log.debug "next emit failure log suppressed"
-        # $log.debug "next logged time is #{Time.at(@next_emit_error_log_time)}"
-      end
-      raise
-    end
-
-    def match(tag)
-      @matches.find {|m| m.match(tag) }
-    end
-
-    def match?(tag)
-      !!match(tag)
+      raise "BUG: use router.emit_stream instead of Engine.emit_stream"
     end
 
     def flush!
-      flush_recursive(@matches)
+      @root_agent.flush!
     end
 
     def now
       # TODO thread update
-      Time.now.to_i
-    end
-
-    def log_event_loop
-      $log.disable_events(Thread.current)
-
-      while sleep(LOG_EMIT_INTERVAL)
-        break if @log_event_loop_stop
-        next if @log_event_queue.empty?
-
-        # NOTE: thead-safe of slice! depends on GVL
-        events = @log_event_queue.slice!(0..-1)
-        next if events.empty?
-
-        events.each {|tag,time,record|
-          begin
-            Engine.emit(tag, time, record)
-          rescue => e
-            $log.error "failed to emit fluentd's log event", :tag => tag, :event => record, :error_class => e.class, :error => e
-          end
-        }
-      end
+      Fluent::EventTime.now
     end
 
     def run
       begin
+        $log.info "starting fluentd worker", pid: Process.pid, ppid: Process.ppid, worker: worker_id
         start
 
-        if match?($log.tag)
-          $log.enable_event
-          @log_emit_thread = Thread.new(&method(:log_event_loop))
-        end
+        @fluent_log_event_router.start
 
-        # for empty loop
-        @default_loop = Coolio::Loop.default
-        @default_loop.attach Coolio::TimerWatcher.new(1, true)
-        # TODO attach async watch for thread pool
-        @default_loop.run
+        $log.info "fluentd worker is now running", worker: worker_id
+        sleep MAINLOOP_SLEEP_INTERVAL until @engine_stopped
+        $log.info "fluentd worker is now stopping", worker: worker_id
 
-      rescue => e
-        $log.error "unexpected error", :error_class=>e.class, :error=>e
+      rescue Exception => e
+        $log.error "unexpected error", error: e
         $log.error_backtrace
-      ensure
-        $log.info "shutting down fluentd"
-        shutdown
-        if @log_emit_thread
-          @log_event_loop_stop = true
-          @log_emit_thread.join
+        raise
+      end
+
+      stop_phase(@root_agent)
+    end
+
+    # @param conf [Fluent::Config]
+    # @param supervisor [Bool]
+    # @reutrn nil
+    def reload_config(conf, supervisor: false)
+      # configure first to reduce down time while restarting
+      new_agent = RootAgent.new(log: log, system_config: @system_config)
+      ret = Fluent::StaticConfigAnalysis.call(conf, workers: system_config.workers)
+
+      ret.all_plugins.each do |plugin|
+        if plugin.respond_to?(:reloadable_plugin?) && !plugin.reloadable_plugin?
+          raise Fluent::ConfigError, "Unreloadable plugin plugin: #{Fluent::Plugin.lookup_type_from_class(plugin.class)}, plugin_id: #{plugin.plugin_id}, class_name: #{plugin.class})"
         end
       end
+
+      # Assign @root_agent to new root_agent
+      # for https://github.com/fluent/fluentd/blob/fcef949ce40472547fde295ddd2cfe297e1eddd6/lib/fluent/plugin_helper/event_emitter.rb#L50
+      old_agent, @root_agent = @root_agent, new_agent
+      begin
+        @root_agent.configure(conf)
+      rescue
+        @root_agent = old_agent
+        raise
+      end
+
+      unless @suppress_config_dump
+        $log.info :supervisor, "using configuration file: #{conf.to_s.rstrip}"
+      end
+
+      # supervisor doesn't handle actual data. so the following code is unnecessary.
+      if supervisor
+        old_agent.shutdown      # to close thread created in #configure
+        return
+      end
+
+      stop_phase(old_agent)
+
+      $log.info 'restart fluentd worker', worker: worker_id
+      start_phase(new_agent)
     end
 
     def stop
-      if @default_loop
-        @default_loop.stop
-        @default_loop = nil
-      end
+      @engine_stopped = true
       nil
     end
 
     def push_log_event(tag, time, record)
-      return if @log_emit_thread.nil?
-      @log_event_queue.push([tag, time, record])
+      @fluent_log_event_router.emit_event([tag, time, record])
+    end
+
+    def worker_id
+      if @supervisor_mode
+        return -1
+      end
+
+      return @_worker_id if @_worker_id
+      # if ENV doesn't have SERVERENGINE_WORKER_ID, it is a worker under --no-supervisor or in tests
+      # so it's (almost) a single worker, worker_id=0
+      @_worker_id = (ENV['SERVERENGINE_WORKER_ID'] || 0).to_i
+      @_worker_id
     end
 
     private
+
+    def stop_phase(root_agent)
+      unless @log_event_verbose
+        $log.enable_event(false)
+        @fluent_log_event_router.graceful_stop
+      end
+      $log.info 'shutting down fluentd worker', worker: worker_id
+      root_agent.shutdown
+
+      @fluent_log_event_router.stop
+    end
+
+    def start_phase(root_agent)
+      @fluent_log_event_router = FluentLogEventRouter.build(root_agent)
+      if @fluent_log_event_router.emittable?
+        $log.enable_event(true)
+      end
+
+      @root_agent.start
+    end
+
     def start
-      @matches.each {|m|
-        m.start
-        @started << m
-      }
-      @sources.each {|s|
-        s.start
-        @started << s
-      }
-    end
-
-    def shutdown
-      @started.map {|s|
-        Thread.new do
-          begin
-            s.shutdown
-          rescue => e
-            $log.warn "unexpected error while shutting down", :error_class=>e.class, :error=>e
-            $log.warn_backtrace
-          end
-        end
-      }.each {|t|
-        t.join
-      }
-    end
-
-    def flush_recursive(array)
-      array.each {|m|
-        begin
-          if m.is_a?(Match)
-            m = m.output
-          end
-          if m.is_a?(BufferedOutput)
-            m.force_flush
-          elsif m.is_a?(MultiOutput)
-            flush_recursive(m.outputs)
-          end
-        rescue => e
-          $log.debug "error while force flushing", :error_class=>e.class, :error=>e
-          $log.debug_backtrace
-        end
-      }
-    end
-
-    class NoMatchMatch
-      def initialize
-        @count = 0
-      end
-
-      def emit(tag, es)
-        # TODO use time instead of num of records
-        c = (@count += 1)
-        if c < 512
-          if Math.log(c) / Math.log(2) % 1.0 == 0
-            $log.warn "no patterns matched", :tag=>tag
-            return
-          end
-        else
-          if c % 512 == 0
-            $log.warn "no patterns matched", :tag=>tag
-            return
-          end
-        end
-        $log.on_trace { $log.trace "no patterns matched", :tag=>tag }
-      end
-
-      def start
-      end
-
-      def shutdown
-      end
-
-      def match(tag)
-        false
-      end
+      @root_agent.start
     end
   end
 
   Engine = EngineClass.new
-
-
-  module Test
-    @@test = false
-
-    def test?
-      @@test
-    end
-
-    def self.setup
-      @@test = true
-
-      Fluent.__send__(:remove_const, :Engine)
-      engine = Fluent.const_set(:Engine, EngineClass.new).init
-
-      engine.define_singleton_method(:now=) {|n|
-        @now = n.to_i
-      }
-      engine.define_singleton_method(:now) {
-        @now || super()
-      }
-
-      nil
-    end
-  end
 end
-

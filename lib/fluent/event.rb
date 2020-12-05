@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,26 +13,68 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
+
+require 'fluent/msgpack_factory'
+require 'fluent/plugin/compressable'
+
 module Fluent
   class EventStream
     include Enumerable
+    include Fluent::Plugin::Compressable
+
+    # dup does deep copy for event stream
+    def dup
+      raise NotImplementedError, "DO NOT USE THIS CLASS directly."
+    end
+
+    def size
+      raise NotImplementedError, "DO NOT USE THIS CLASS directly."
+    end
+    alias :length :size
+
+    def empty?
+      size == 0
+    end
+
+    # for tests
+    def ==(other)
+      other.is_a?(EventStream) && self.to_msgpack_stream == other.to_msgpack_stream
+    end
 
     def repeatable?
       false
     end
 
-    #def each(&block)
-    #end
+    def slice(index, num)
+      raise NotImplementedError, "DO NOT USE THIS CLASS directly."
+    end
 
-    def to_msgpack_stream
-      out = ''
+    def each(unapcker: nil, &block)
+      raise NotImplementedError, "DO NOT USE THIS CLASS directly."
+    end
+
+    def to_msgpack_stream(time_int: false, packer: nil)
+      return to_msgpack_stream_forced_integer(packer: packer) if time_int
+      out = packer || Fluent::MessagePackFactory.msgpack_packer
       each {|time,record|
-        [time,record].to_msgpack(out)
+        out.write([time,record])
       }
-      out
+      out.full_pack
+    end
+
+    def to_compressed_msgpack_stream(time_int: false, packer: nil)
+      packed = to_msgpack_stream(time_int: time_int, packer: packer)
+      compress(packed)
+    end
+
+    def to_msgpack_stream_forced_integer(packer: nil)
+      out = packer || Fluent::MessagePackFactory.msgpack_packer
+      each {|time,record|
+        out.write([time.to_i,record])
+      }
+      out.full_pack
     end
   end
-
 
   class OneEventStream < EventStream
     def initialize(time, record)
@@ -46,25 +86,48 @@ module Fluent
       OneEventStream.new(@time, @record.dup)
     end
 
+    def empty?
+      false
+    end
+
+    def size
+      1
+    end
+
     def repeatable?
       true
     end
 
-    def each(&block)
+    def slice(index, num)
+      if index > 0 || num == 0
+        ArrayEventStream.new([])
+      else
+        self.dup
+      end
+    end
+
+    def each(unpacker: nil, &block)
       block.call(@time, @record)
       nil
     end
   end
 
-
+  # EventStream from entries: Array of [time, record]
+  #
+  # Use this class for many events data with a tag
+  # and its representation is [ [time, record], [time, record], .. ]
   class ArrayEventStream < EventStream
     def initialize(entries)
       @entries = entries
     end
 
     def dup
-      entries = @entries.map(:dup)
+      entries = @entries.map{ |time, record| [time, record.dup] }
       ArrayEventStream.new(entries)
+    end
+
+    def size
+      @entries.size
     end
 
     def repeatable?
@@ -75,31 +138,38 @@ module Fluent
       @entries.empty?
     end
 
-    def each(&block)
+    def slice(index, num)
+      ArrayEventStream.new(@entries.slice(index, num))
+    end
+
+    def each(unpacker: nil, &block)
       @entries.each(&block)
       nil
     end
-
-    #attr_reader :entries
-    #
-    #def to_a
-    #  @entries
-    #end
   end
 
-
+  # EventStream from entries: numbers of pairs of time and record.
+  #
+  # This class can handle many events more efficiently than ArrayEventStream
+  # because this class generate less objects than ArrayEventStream.
+  #
+  # Use this class as below, in loop of data-enumeration:
+  #  1. initialize blank stream:
+  #     streams[tag] ||= MultiEventStream.new
+  #  2. add events
+  #     stream[tag].add(time, record)
   class MultiEventStream < EventStream
-    def initialize
-      @time_array = []
-      @record_array = []
+    def initialize(time_array = [], record_array = [])
+      @time_array = time_array
+      @record_array = record_array
     end
 
     def dup
-      es = MultiEventStream.new
-      @time_array.zip(@record_array).each { |time, record|
-        es.add(time, record.dup)
-      }
-      es
+      MultiEventStream.new(@time_array.dup, @record_array.map(&:dup))
+    end
+
+    def size
+      @time_array.size
     end
 
     def add(time, record)
@@ -115,7 +185,11 @@ module Fluent
       @time_array.empty?
     end
 
-    def each(&block)
+    def slice(index, num)
+      MultiEventStream.new(@time_array.slice(index, num), @record_array.slice(index, num))
+    end
+
+    def each(unpacker: nil, &block)
       time_array = @time_array
       record_array = @record_array
       for i in 0..time_array.length-1
@@ -125,73 +199,138 @@ module Fluent
     end
   end
 
-  if $use_msgpack_5
+  class MessagePackEventStream < EventStream
+    # https://github.com/msgpack/msgpack-ruby/issues/119
 
-    class MessagePackEventStream < EventStream
-      def initialize(data, cached_unpacker=nil)
-        @data = data
-      end
+    # Keep cached_unpacker argument for existing plugins
+    def initialize(data, cached_unpacker = nil, size = 0, unpacked_times: nil, unpacked_records: nil)
+      @data = data
+      @size = size
+      @unpacked_times = unpacked_times
+      @unpacked_records = unpacked_records
+    end
 
-      def repeatable?
-        true
-      end
+    def empty?
+      @data.empty?
+    end
 
-      def each(&block)
-        # TODO format check
-        unpacker = MessagePack::Unpacker.new
-        unpacker.feed_each(@data, &block)
-        nil
-      end
-
-      def to_msgpack_stream
-        @data
+    def dup
+      if @unpacked_times
+        self.class.new(@data.dup, nil, @size, unpacked_times: @unpacked_times, unpacked_records: @unpacked_records.map(&:dup))
+      else
+        self.class.new(@data.dup, nil, @size)
       end
     end
 
-  else # for 0.4.x. Will be removed after 0.5.x is stable
-
-    class MessagePackEventStream < EventStream
-      def initialize(data, cached_unpacker=nil)
-        @data = data
-        @unpacker = cached_unpacker || MessagePack::Unpacker.new
-      end
-
-      def repeatable?
-        true
-      end
-
-      def each(&block)
-        @unpacker.reset
-        # TODO format check
-        @unpacker.feed_each(@data, &block)
-        nil
-      end
-
-      def to_msgpack_stream
-        @data
-      end
+    def size
+      # @size is unbelievable always when @size == 0
+      # If the number of events is really zero, unpacking events takes very short time.
+      ensure_unpacked! if @size == 0
+      @size
     end
 
+    def repeatable?
+      true
+    end
+
+    def ensure_unpacked!(unpacker: nil)
+      return if @unpacked_times && @unpacked_records
+      @unpacked_times = []
+      @unpacked_records = []
+      (unpacker || Fluent::MessagePackFactory.msgpack_unpacker).feed_each(@data) do |time, record|
+        @unpacked_times << time
+        @unpacked_records << record
+      end
+      # @size should be updated always right after unpack.
+      # The real size of unpacked objects are correct, rather than given size.
+      @size = @unpacked_times.size
+    end
+
+    # This method returns MultiEventStream, because there are no reason
+    # to surve binary serialized by msgpack.
+    def slice(index, num)
+      ensure_unpacked!
+      MultiEventStream.new(@unpacked_times.slice(index, num), @unpacked_records.slice(index, num))
+    end
+
+    def each(unpacker: nil, &block)
+      if @unpacked_times
+        @unpacked_times.each_with_index do |time, i|
+          block.call(time, @unpacked_records[i])
+        end
+      else
+        @unpacked_times = []
+        @unpacked_records = []
+        (unpacker || Fluent::MessagePackFactory.msgpack_unpacker).feed_each(@data) do |time, record|
+          @unpacked_times << time
+          @unpacked_records << record
+          block.call(time, record)
+        end
+        @size = @unpacked_times.size
+      end
+      nil
+    end
+
+    def to_msgpack_stream(time_int: false, packer: nil)
+      # time_int is always ignored because @data is always packed binary in this class
+      @data
+    end
   end
 
-  #class IoEventStream < EventStream
-  #  def initialize(io, num)
-  #    @io = io
-  #    @num = num
-  #    @u = MessagePack::Unpacker.new(@io)
-  #  end
-  #
-  #  def repeatable?
-  #    false
-  #  end
-  #
-  #  def each(&block)
-  #    return nil if @num == 0
-  #    @u.each {|obj|
-  #      block.call(obj[0], obj[1])
-  #      break if @array.size >= @num
-  #    }
-  #  end
-  #end
-end
+  class CompressedMessagePackEventStream < MessagePackEventStream
+    def initialize(data, cached_unpacker = nil, size = 0, unpacked_times: nil, unpacked_records: nil)
+      super
+      @decompressed_data = nil
+      @compressed_data = data
+    end
 
+    def empty?
+      ensure_decompressed!
+      super
+    end
+
+    def ensure_unpacked!(unpacker: nil)
+      ensure_decompressed!
+      super
+    end
+
+    def each(unpacker: nil, &block)
+      ensure_decompressed!
+      super
+    end
+
+    def to_msgpack_stream(time_int: false, packer: nil)
+      ensure_decompressed!
+      super
+    end
+
+    def to_compressed_msgpack_stream(time_int: false)
+      # time_int is always ignored because @data is always packed binary in this class
+      @compressed_data
+    end
+
+    private
+
+    def ensure_decompressed!
+      return if @decompressed_data
+      @data = @decompressed_data = decompress(@data)
+    end
+  end
+
+  module ChunkMessagePackEventStreamer
+    # chunk.extend(ChunkEventStreamer)
+    #  => chunk.each{|time, record| ... }
+    def each(unpacker: nil, &block)
+      open do |io|
+        (unpacker || Fluent::MessagePackFactory.msgpack_unpacker(io)).each(&block)
+      end
+      nil
+    end
+    alias :msgpack_each :each
+
+    def to_msgpack_stream(time_int: false, packer: nil)
+      # time_int is always ignored because data is already packed and written in chunk
+      read
+    end
+  end
+end

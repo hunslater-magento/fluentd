@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,37 +13,62 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
-module Fluent
+
+require 'fluent/plugin/output'
+
+module Fluent::Plugin
   class StdoutOutput < Output
-    Plugin.register_output('stdout', self)
+    Fluent::Plugin.register_output('stdout', self)
 
-    OUTPUT_PROCS = {
-      :json => Proc.new {|record| Yajl.dump(record) },
-      :hash => Proc.new {|record| record.to_s },
-    }
+    helpers :inject, :formatter, :compat_parameters
 
-    config_param :output_type, :default => :json do |val|
-      case val.downcase
-      when 'json'
-        :json
-      when 'hash'
-        :hash
-      else
-        raise ConfigError, "stdout output output_type should be 'json' or 'hash'"
-      end
+    DEFAULT_LINE_FORMAT_TYPE = 'stdout'
+    DEFAULT_FORMAT_TYPE = 'json'
+
+    config_section :buffer do
+      config_set_default :chunk_keys, ['tag']
+      config_set_default :flush_at_shutdown, true
+      config_set_default :chunk_limit_size, 10 * 1024
     end
+
+    config_section :format do
+      config_set_default :@type, DEFAULT_LINE_FORMAT_TYPE
+      config_set_default :output_type, DEFAULT_FORMAT_TYPE
+    end
+
+    def prefer_buffered_processing
+      false
+    end
+
+    def multi_workers_ready?
+      true
+    end
+
+    attr_accessor :formatter
+
     def configure(conf)
+      compat_parameters_convert(conf, :inject, :formatter)
+
       super
-      @output_proc = OUTPUT_PROCS[@output_type]
+
+      @formatter = formatter_create
     end
 
-    def emit(tag, es, chain)
+    def process(tag, es)
+      es = inject_values_to_event_stream(tag, es)
       es.each {|time,record|
-        $log.write "#{Time.at(time).localtime} #{tag}: #{@output_proc.call(record)}\n"
+        $log.write(format(tag, time, record))
       }
       $log.flush
+    end
 
-      chain.next
+    def format(tag, time, record)
+      record = inject_values_to_record(tag, time, record)
+      @formatter.format(tag, time, record).chomp + "\n"
+    end
+
+    def write(chunk)
+      chunk.write_to($log)
     end
   end
 end

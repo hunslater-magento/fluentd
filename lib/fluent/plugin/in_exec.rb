@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,139 +13,98 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
-module Fluent
-  class ExecInput < Input
-    Plugin.register_input('exec', self)
 
-    def initialize
-      super
-      require 'fluent/plugin/exec_util'
-    end
+require 'fluent/plugin/input'
+require 'yajl'
 
-    SUPPORTED_FORMAT = {
-      'tsv' => :tsv,
-      'json' => :json,
-      'msgpack' => :msgpack,
-    }
+module Fluent::Plugin
+  class ExecInput < Fluent::Plugin::Input
+    Fluent::Plugin.register_input('exec', self)
 
+    helpers :compat_parameters, :extract, :parser, :child_process
+
+    desc 'The command (program) to execute.'
     config_param :command, :string
-    config_param :format, :default => :tsv do |val|
-      f = SUPPORTED_FORMAT[val]
-      raise ConfigError, "Unsupported format '#{val}'" unless f
-      f
+    desc 'Specify connect mode to executed process'
+    config_param :connect_mode, :enum, list: [:read, :read_with_stderr], default: :read
+
+    config_section :parse do
+      config_set_default :@type, 'tsv'
+      config_set_default :time_type, :float
+      config_set_default :time_key, nil
+      config_set_default :estimate_current_event, false
     end
-    config_param :keys, :default => [] do |val|
-      val.split(',')
+
+    config_section :extract do
+      config_set_default :time_type, :float
     end
-    config_param :tag, :string, :default => nil
-    config_param :tag_key, :string, :default => nil
-    config_param :time_key, :string, :default => nil
-    config_param :time_format, :string, :default => nil
-    config_param :run_interval, :time, :default => nil
+
+    desc 'Tag of the output events.'
+    config_param :tag, :string, default: nil
+    desc 'The interval time between periodic program runs.'
+    config_param :run_interval, :time, default: nil
+    desc 'The default block size to read if parser requires partial read.'
+    config_param :read_block_size, :size, default: 10240 # 10k
+
+    attr_reader :parser
 
     def configure(conf)
+      compat_parameters_convert(conf, :extract, :parser)
+      ['parse', 'extract'].each do |subsection_name|
+        if subsection = conf.elements(subsection_name).first
+          if subsection.has_key?('time_format')
+            subsection['time_type'] ||= 'string'
+          end
+        end
+      end
+
       super
 
-      if localtime = conf['localtime']
-        @localtime = true
-      elsif utc = conf['utc']
-        @localtime = false
+      if !@tag && (!@extract_config || !@extract_config.tag_key)
+        raise Fluent::ConfigError, "'tag' or 'tag_key' option is required on exec input"
       end
+      @parser = parser_create
+    end
 
-      if !@tag && !@tag_key
-        raise ConfigError, "'tag' or 'tag_key' option is required on exec input"
-      end
-
-      if @time_key
-        if @time_format
-          f = @time_format
-          @time_parse_proc = Proc.new {|str| Time.strptime(str, f).to_i }
-        else
-          @time_parse_proc = Proc.new {|str| str.to_i }
-        end
-      end
-
-      case @format
-      when :tsv
-        if @keys.empty?
-          raise ConfigError, "keys option is required on exec input for tsv format"
-        end
-        @parser = ExecUtil::TSVParser.new(@keys, method(:on_message))
-      when :json
-        @parser = ExecUtil::JSONParser.new(method(:on_message))
-      when :msgpack
-        @parser = ExecUtil::MessagePackParser.new(method(:on_message))
-      end
+    def multi_workers_ready?
+      true
     end
 
     def start
+      super
+
       if @run_interval
-        @finished = false
-        @thread = Thread.new(&method(:run_periodic))
+        child_process_execute(:exec_input, @command, interval: @run_interval, mode: [@connect_mode], &method(:run))
       else
-        @io = IO.popen(@command, "r")
-        @pid = @io.pid
-        @thread = Thread.new(&method(:run))
+        child_process_execute(:exec_input, @command, immediate: true, mode: [@connect_mode], &method(:run))
       end
     end
 
-    def shutdown
-      if @run_interval
-        @finished = true
-        @thread.join
+    def run(io)
+      case
+      when @parser.implement?(:parse_io)
+        @parser.parse_io(io, &method(:on_record))
+      when @parser.implement?(:parse_partial_data)
+        until io.eof?
+          @parser.parse_partial_data(io.readpartial(@read_block_size), &method(:on_record))
+        end
+      when @parser.parser_type == :text_per_line
+        io.each_line do |line|
+          @parser.parse(line.chomp, &method(:on_record))
+        end
       else
-        begin
-          Process.kill(:TERM, @pid)
-        rescue #Errno::ECHILD, Errno::ESRCH, Errno::EPERM
-        end
-        if @thread.join(60)  # TODO wait time
-          return
-        end
-
-        begin
-          Process.kill(:KILL, @pid)
-        rescue #Errno::ECHILD, Errno::ESRCH, Errno::EPERM
-        end
-        @thread.join
+        @parser.parse(io.read, &method(:on_record))
       end
     end
 
-    def run
-      @parser.call(@io)
-    end
-
-    def run_periodic
-      until @finished
-        begin
-          sleep @run_interval
-          io = IO.popen(@command, "r")
-          @parser.call(io)
-          Process.waitpid(io.pid)
-        rescue
-          $log.error "exec failed to run or shutdown child process", :error => $!.to_s, :error_class => $!.class.to_s
-          $log.warn_backtrace $!.backtrace
-        end
-      end
-    end
-
-    private
-
-    def on_message(record)
-      if val = record.delete(@tag_key)
-        tag = val
-      else
-        tag = @tag
-      end
-
-      if val = record.delete(@time_key)
-        time = @time_parse_proc.call(val)
-      else
-        time = Engine.now
-      end
-
-      Engine.emit(tag, time, record)
+    def on_record(time, record)
+      tag = extract_tag_from_record(record)
+      tag ||= @tag
+      time ||= extract_time_from_record(record) || Fluent::EventTime.now
+      router.emit(tag, time, record)
     rescue => e
-      $log.error "exec failed to emit", :error => e.to_s, :error_class => e.class.to_s, :tag => tag, :record => Yajl.dump(record)
+      log.error "exec failed to emit", tag: tag, record: Yajl.dump(record), error: e
+      router.emit_error_event(tag, time, record, e) if tag && time && record
     end
   end
 end

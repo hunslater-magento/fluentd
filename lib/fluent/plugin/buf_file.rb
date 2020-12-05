@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,199 +13,201 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
+
+require 'fileutils'
+
+require 'fluent/plugin/buffer'
+require 'fluent/plugin/buffer/file_chunk'
+require 'fluent/system_config'
+require 'fluent/variable_store'
+
 module Fluent
-  class FileBufferChunk < BufferChunk
-    def initialize(key, path, unique_id, mode="a+", symlink_path = nil)
-      super(key)
-      @path = path
-      @unique_id = unique_id
-      @file = File.open(@path, mode, DEFAULT_FILE_PERMISSION)
-      @file.sync = true
-      @size = @file.stat.size
-      FileUtils.ln_sf(@path, symlink_path) if symlink_path
-    end
+  module Plugin
+    class FileBuffer < Fluent::Plugin::Buffer
+      Plugin.register_buffer('file', self)
 
-    attr_reader :unique_id
+      include SystemConfig::Mixin
 
-    def <<(data)
-      @file.write(data)
-      @size += data.bytesize
-    end
+      DEFAULT_CHUNK_LIMIT_SIZE = 256 * 1024 * 1024        # 256MB
+      DEFAULT_TOTAL_LIMIT_SIZE =  64 * 1024 * 1024 * 1024 #  64GB, same with v0.12 (TimeSlicedOutput + buf_file)
 
-    def size
-      @size
-    end
+      desc 'The path where buffer chunks are stored.'
+      config_param :path, :string, default: nil
+      desc 'The suffix of buffer chunks'
+      config_param :path_suffix, :string, default: '.log'
 
-    def empty?
-      @size == 0
-    end
+      config_set_default :chunk_limit_size, DEFAULT_CHUNK_LIMIT_SIZE
+      config_set_default :total_limit_size, DEFAULT_TOTAL_LIMIT_SIZE
 
-    def close
-      stat = @file.stat
-      @file.close
-      if stat.size == 0
-        File.unlink(@path)
-      end
-    end
+      config_param :file_permission, :string, default: nil # '0644'
+      config_param :dir_permission,  :string, default: nil # '0755'
 
-    def purge
-      @file.close
-      File.unlink(@path) rescue nil  # TODO rescue?
-    end
-
-    def read
-      @file.pos = 0
-      @file.read
-    end
-
-    def open(&block)
-      @file.pos = 0
-      yield @file
-    end
-
-    attr_reader :path
-
-    def mv(path)
-      File.rename(@path, path)
-      @path = path
-    end
-  end
-
-  class FileBuffer < BasicBuffer
-    Plugin.register_buffer('file', self)
-
-    @@buffer_paths = {}
-
-    def initialize
-      require 'uri'
-      super
-    end
-
-    config_param :buffer_path, :string
-
-    attr_accessor :symlink_path
-
-    def configure(conf)
-      super
-
-      if @@buffer_paths.has_key?(@buffer_path)
-        raise ConfigError, "Other '#{@@buffer_paths[@buffer_path]}' plugin already use same buffer_path: type = #{conf['type']}, buffer_path = #{@buffer_path}"
-      else
-        @@buffer_paths[@buffer_path] = conf['type']
+      def initialize
+        super
+        @symlink_path = nil
+        @multi_workers_available = false
+        @additional_resume_path = nil
+        @buffer_path = nil
+        @variable_store = nil
       end
 
-      if pos = @buffer_path.index('*')
-        @buffer_path_prefix = @buffer_path[0,pos]
-        @buffer_path_suffix = @buffer_path[pos+1..-1]
-      else
-        @buffer_path_prefix = @buffer_path+"."
-        @buffer_path_suffix = ".log"
-      end
+      def configure(conf)
+        super
 
-      if flush_at_shutdown = conf['flush_at_shutdown']
-        @flush_at_shutdown = true
-      else
-        @flush_at_shutdown = false
-      end
-    end
+        @variable_store = Fluent::VariableStore.fetch_or_build(:buf_file)
 
-    def start
-      FileUtils.mkdir_p File.dirname(@buffer_path_prefix+"path")
-      super
-    end
+        multi_workers_configured = owner.system_config.workers > 1 ? true : false
 
-    PATH_MATCH = /^(.*)[\._](b|q)([0-9a-fA-F]{1,32})$/
-
-    def new_chunk(key)
-      encoded_key = encode_key(key)
-      path, tsuffix = make_path(encoded_key, "b")
-      unique_id = tsuffix_to_unique_id(tsuffix)
-      FileBufferChunk.new(key, path, unique_id, "a+", @symlink_path)
-    end
-
-    def resume
-      maps = []
-      queues = []
-
-      Dir.glob("#{@buffer_path_prefix}*#{@buffer_path_suffix}") {|path|
-        match = path[@buffer_path_prefix.length..-(@buffer_path_suffix.length+1)]
-        if m = PATH_MATCH.match(match)
-          key = decode_key(m[1])
-          bq = m[2]
-          tsuffix = m[3]
-          timestamp = m[3].to_i(16)
-          unique_id = tsuffix_to_unique_id(tsuffix)
-
-          if bq == 'b'
-            chunk = FileBufferChunk.new(key, path, unique_id, "a+")
-            maps << [timestamp, chunk]
-          elsif bq == 'q'
-            chunk = FileBufferChunk.new(key, path, unique_id, "r")
-            queues << [timestamp, chunk]
+        using_plugin_root_dir = false
+        unless @path
+          if root_dir = owner.plugin_root_dir
+            @path = File.join(root_dir, 'buffer')
+            using_plugin_root_dir = true # plugin_root_dir path contains worker id
+          else
+            raise Fluent::ConfigError, "buffer path is not configured. specify 'path' in <buffer>"
           end
         end
-      }
 
-      map = {}
-      maps.sort_by {|(timestamp,chunk)|
-        timestamp
-      }.each {|(timestamp,chunk)|
-        map[chunk.key] = chunk
-      }
+        type_of_owner = Plugin.lookup_type_from_class(@_owner.class)
+        if @variable_store.has_key?(@path) && !called_in_test?
+          type_using_this_path = @variable_store[@path]
+          raise ConfigError, "Other '#{type_using_this_path}' plugin already use same buffer path: type = #{type_of_owner}, buffer path = #{@path}"
+        end
 
-      queue = queues.sort_by {|(timestamp,chunk)|
-        timestamp
-      }.map {|(timestamp,chunk)|
-        chunk
-      }
+        @buffer_path = @path
+        @variable_store[@buffer_path] = type_of_owner
 
-      return queue, map
-    end
+        specified_directory_exists = File.exist?(@path) && File.directory?(@path)
+        unexisting_path_for_directory = !File.exist?(@path) && !@path.include?('.*')
 
-    def enqueue(chunk)
-      path = chunk.path
-      mp = path[@buffer_path_prefix.length..-(@buffer_path_suffix.length+1)]
-
-      m = PATH_MATCH.match(mp)
-      encoded_key = m ? m[1] : ""
-      tsuffix = m[3]
-      npath = "#{@buffer_path_prefix}#{encoded_key}.q#{tsuffix}#{@buffer_path_suffix}"
-
-      chunk.mv(npath)
-    end
-
-    def before_shutdown(out)
-      if @flush_at_shutdown
-        synchronize do
-          @map.each_key {|key|
-            push(key)
-          }
-          while pop(out)
+        if specified_directory_exists || unexisting_path_for_directory # directory
+          if using_plugin_root_dir || !multi_workers_configured
+            @path = File.join(@path, "buffer.*#{@path_suffix}")
+          else
+            @path = File.join(@path, "worker#{fluentd_worker_id}", "buffer.*#{@path_suffix}")
+            if fluentd_worker_id == 0
+              # worker 0 always checks unflushed buffer chunks to be resumed (might be created while non-multi-worker configuration)
+              @additional_resume_path = File.join(File.expand_path("../../", @path), "buffer.*#{@path_suffix}")
+            end
           end
+          @multi_workers_available = true
+        else # specified path is file path
+          if File.basename(@path).include?('.*.')
+            # valid file path
+          elsif File.basename(@path).end_with?('.*')
+            @path = @path + @path_suffix
+          else
+            # existing file will be ignored
+            @path = @path + ".*#{@path_suffix}"
+          end
+          @multi_workers_available = false
+        end
+
+        if @dir_permission
+          @dir_permission = @dir_permission.to_i(8) if @dir_permission.is_a?(String)
+        else
+          @dir_permission = system_config.dir_permission || Fluent::DEFAULT_DIR_PERMISSION
         end
       end
-    end
 
-    protected
+      # This method is called only when multi worker is configured
+      def multi_workers_ready?
+        unless @multi_workers_available
+          log.error "file buffer with multi workers should be configured to use directory 'path', or system root_dir and plugin id"
+        end
+        @multi_workers_available
+      end
 
-    def encode_key(key)
-      URI.escape(key, /[^-_.a-zA-Z0-9]/n)
-    end
+      def start
+        FileUtils.mkdir_p File.dirname(@path), mode: @dir_permission
 
-    def decode_key(encoded_key)
-      URI.unescape(encoded_key)
-    end
+        super
+      end
 
-    def make_path(encoded_key, bq)
-      now = Time.now.utc
-      timestamp = ((now.to_i*1000*1000+now.usec) << 12 | rand(0xfff))
-      tsuffix = timestamp.to_s(16)
-      path = "#{@buffer_path_prefix}#{encoded_key}.#{bq}#{tsuffix}#{@buffer_path_suffix}"
-      return path, tsuffix
-    end
+      def stop
+        if @variable_store
+          @variable_store.delete(@buffer_path)
+        end
 
-    def tsuffix_to_unique_id(tsuffix)
-      tsuffix.scan(/../).map {|x| x.to_i(16) }.pack('C*') * 2
+        super
+      end
+
+      def persistent?
+        true
+      end
+
+      def resume
+        stage = {}
+        queue = []
+
+        patterns = [@path]
+        patterns.unshift @additional_resume_path if @additional_resume_path
+        Dir.glob(escaped_patterns(patterns)) do |path|
+          next unless File.file?(path)
+
+          log.debug { "restoring buffer file: path = #{path}" }
+
+          m = new_metadata() # this metadata will be overwritten by resuming .meta file content
+                             # so it should not added into @metadata_list for now
+          mode = Fluent::Plugin::Buffer::FileChunk.assume_chunk_state(path)
+          if mode == :unknown
+            log.debug "unknown state chunk found", path: path
+            next
+          end
+
+          begin
+            chunk = Fluent::Plugin::Buffer::FileChunk.new(m, path, mode, compress: @compress) # file chunk resumes contents of metadata
+          rescue Fluent::Plugin::Buffer::FileChunk::FileChunkError => e
+            handle_broken_files(path, mode, e)
+            next
+          end
+
+          case chunk.state
+          when :staged
+            # unstaged chunk created at Buffer#write_step_by_step is identified as the staged chunk here because FileChunk#assume_chunk_state checks only the file name.
+            # https://github.com/fluent/fluentd/blob/9d113029d4550ce576d8825bfa9612aa3e55bff0/lib/fluent/plugin/buffer.rb#L663
+            # This case can happen when fluentd process is killed by signal or other reasons between creating unstaged chunks and changing them to staged mode in Buffer#write
+            # these chunks(unstaged chunks) has shared the same metadata
+            # So perform enqueue step again https://github.com/fluent/fluentd/blob/9d113029d4550ce576d8825bfa9612aa3e55bff0/lib/fluent/plugin/buffer.rb#L364
+            if chunk_size_full?(chunk) || stage.key?(chunk.metadata)
+              chunk.metadata.seq = 0 # metadata.seq should be 0 for counting @queued_num
+              queue << chunk.enqueued!
+            else
+              stage[chunk.metadata] = chunk
+            end
+          when :queued
+            queue << chunk
+          end
+        end
+
+        queue.sort_by!{ |chunk| chunk.modified_at }
+
+        return stage, queue
+      end
+
+      def generate_chunk(metadata)
+        # FileChunk generates real path with unique_id
+        perm = @file_permission || system_config.file_permission
+        chunk = Fluent::Plugin::Buffer::FileChunk.new(metadata, @path, :create, perm: perm, compress: @compress)
+        log.debug "Created new chunk", chunk_id: dump_unique_id_hex(chunk.unique_id), metadata: metadata
+
+        return chunk
+      end
+
+      def handle_broken_files(path, mode, e)
+        log.error "found broken chunk file during resume. Deleted corresponding files:", :path => path, :mode => mode, :err_msg => e.message
+        # After support 'backup_dir' feature, these files are moved to backup_dir instead of unlink.
+        File.unlink(path, path + '.meta') rescue nil
+      end
+
+      private
+
+      def escaped_patterns(patterns)
+        patterns.map { |pattern|
+          # '{' '}' are special character in Dir.glob
+          pattern.gsub(/[\{\}]/) { |c| "\\#{c}" }
+        }
+      end
     end
   end
 end

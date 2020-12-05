@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,6 +13,11 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
+
+require 'fluent/engine'
+require 'fluent/event'
+require 'fluent/test/input_test'
+
 module Fluent
   module Test
     class TestOutputChain
@@ -38,11 +41,9 @@ module Fluent
 
       attr_accessor :tag
 
-      def emit(record, time=Time.now)
-        es = OneEventStream.new(time.to_i, record)
-        chain = TestOutputChain.new
-        @instance.emit(@tag, es, chain)
-        assert_equal 1, chain.called
+      def emit(record, time=EventTime.now)
+        es = OneEventStream.new(time, record)
+        @instance.emit_events(@tag, es)
       end
     end
 
@@ -53,12 +54,16 @@ module Fluent
         @entries = []
         @expected_buffer = nil
         @tag = tag
+
+        def @instance.buffer
+          @buffer
+        end
       end
 
       attr_accessor :tag
 
-      def emit(record, time=Time.now)
-        @entries << [time.to_i, record]
+      def emit(record, time=EventTime.now)
+        @entries << [time, record]
         self
       end
 
@@ -66,20 +71,30 @@ module Fluent
         (@expected_buffer ||= '') << str
       end
 
-      def run(&block)
+      def run(num_waits = 10, &block)
         result = nil
-        super {
+        super(num_waits) {
+          block.call if block
+
           es = ArrayEventStream.new(@entries)
           buffer = @instance.format_stream(@tag, es)
-
-          block.call if block
 
           if @expected_buffer
             assert_equal(@expected_buffer, buffer)
           end
 
-          chunk = MemoryBufferChunk.new('', buffer)
-          result = @instance.write(chunk)
+          chunk = if @instance.instance_eval{ @chunk_key_tag }
+                    @instance.buffer.generate_chunk(@instance.metadata(@tag, nil, nil)).staged!
+                  else
+                    @instance.buffer.generate_chunk(@instance.metadata(nil, nil, nil)).staged!
+                  end
+          chunk.concat(buffer, es.size)
+
+          begin
+            result = @instance.write(chunk)
+          ensure
+            chunk.purge
+          end
         }
         result
       end
@@ -88,18 +103,15 @@ module Fluent
     class TimeSlicedOutputTestDriver < InputTestDriver
       def initialize(klass, tag='test', &block)
         super(klass, &block)
-        @entries = {}
+        @entries = []
         @expected_buffer = nil
         @tag = tag
       end
 
       attr_accessor :tag
 
-      def emit(record, time=Time.now)
-        slicer = @instance.instance_eval{@time_slicer}
-        key = slicer.call(time.to_i)
-        @entries[key] = [] unless @entries.has_key?(key)
-        @entries[key] << [time.to_i, record]
+      def emit(record, time=EventTime.now)
+        @entries << [time, record]
         self
       end
 
@@ -110,31 +122,32 @@ module Fluent
       def run(&block)
         result = []
         super {
-          buffer = ''
-          @entries.keys.each {|key|
-            es = ArrayEventStream.new(@entries[key])
-            @instance.emit(@tag, es, NullOutputChain.instance)
-            buffer << @instance.format_stream(@tag, es)
-          }
-
           block.call if block
+
+          buffer = ''
+          lines = {}
+          # v0.12 TimeSlicedOutput doesn't call #format_stream
+          @entries.each do |time, record|
+            meta = @instance.metadata(@tag, time, record)
+            line = @instance.format(@tag, time, record)
+            buffer << line
+            lines[meta] ||= []
+            lines[meta] << line
+          end
 
           if @expected_buffer
             assert_equal(@expected_buffer, buffer)
           end
 
-          chunks = @instance.instance_eval {
-            @buffer.instance_eval {
-              chunks = []
-              @map.keys.each {|key|
-                chunks.push(@map.delete(key))
-              }
-              chunks
-            }
-          }
-          chunks.each { |chunk|
-            result.push(@instance.write(chunk))
-          }
+          lines.keys.each do |meta|
+            chunk = @instance.buffer.generate_chunk(meta).staged!
+            chunk.append(lines[meta])
+            begin
+              result.push(@instance.write(chunk))
+            ensure
+              chunk.purge
+            end
+          end
         }
         result
       end

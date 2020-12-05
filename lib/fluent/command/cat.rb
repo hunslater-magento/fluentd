@@ -1,7 +1,5 @@
 #
-# Fluent cat
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -18,18 +16,25 @@
 
 require 'optparse'
 require 'fluent/env'
+require 'fluent/time'
+require 'fluent/msgpack_factory'
+require 'fluent/version'
 
 op = OptionParser.new
 
 op.banner += " <tag>"
+op.version = Fluent::VERSION
 
-port = Fluent::DEFAULT_LISTEN_PORT
+port = 24224
 host = '127.0.0.1'
 unix = false
 socket_path = Fluent::DEFAULT_SOCKET_PATH
 
 config_path = Fluent::DEFAULT_CONFIG_PATH
 format = 'json'
+message_key = 'message'
+time_as_integer = false
+retry_limit = 5
 
 op.on('-p', '--port PORT', "fluent tcp port (default: #{port})", Integer) {|i|
   port = i
@@ -59,7 +64,23 @@ op.on('--msgpack', "same as: -f msgpack", TrueClass) {|b|
   format = 'msgpack'
 }
 
-(class<<self;self;end).module_eval do
+op.on('--none', "same as: -f none", TrueClass) {|b|
+  format = 'none'
+}
+
+op.on('--message-key KEY', "key field for none format (default: #{message_key})") {|s|
+  message_key = s
+}
+
+op.on('--time-as-integer', "Send time as integer for v0.12 or earlier", TrueClass) { |b|
+  time_as_integer = true
+}
+
+op.on('--retry-limit N', "Specify the number of retry limit (default: #{retry_limit})", Integer) {|n|
+  retry_limit = n
+}
+
+singleton_class.module_eval do
   define_method(:usage) do |msg|
     puts op.to_s
     puts "error: #{msg}" if msg
@@ -80,16 +101,16 @@ rescue
   usage $!.to_s
 end
 
-
 require 'thread'
-require 'monitor'
 require 'socket'
 require 'yajl'
 require 'msgpack'
-
+require 'fluent/ext_monitor_require'
 
 class Writer
   include MonitorMixin
+
+  RetryLimitError = Class.new(StandardError)
 
   class TimerThread
     def initialize(writer)
@@ -114,7 +135,7 @@ class Writer
     end
   end
 
-  def initialize(tag, connector)
+  def initialize(tag, connector, time_as_integer: false, retry_limit: 5)
     @tag = tag
     @connector = connector
     @socket = false
@@ -126,7 +147,8 @@ class Writer
     @pending = []
     @pending_limit = 1024  # TODO
     @retry_wait = 1
-    @retry_limit = 5  # TODO
+    @retry_limit = retry_limit
+    @time_as_integer = time_as_integer
 
     super()
   end
@@ -136,7 +158,9 @@ class Writer
       raise ArgumentError, "Input must be a map (got #{record.class})"
     end
 
-    entry = [Time.now.to_i, record]
+    time = Fluent::EventTime.now
+    time = time.to_i if @time_as_integer
+    entry = [time, record]
     synchronize {
       unless write_impl([entry])
         # write failed
@@ -193,7 +217,8 @@ class Writer
     end
 
     begin
-      socket.write [@tag, array].to_msgpack
+      packer = Fluent::MessagePackFactory.packer
+      socket.write packer.pack([@tag, array])
       socket.flush
     rescue
       $stderr.puts "write failed: #{$!}"
@@ -216,21 +241,24 @@ class Writer
   end
 
   def try_connect
-    now = Time.now.to_i
-
-    unless @error_history.empty?
-      # wait before re-connecting
-      wait = @retry_wait * (2 ** (@error_history.size-1))
-      if now <= @socket_time + wait
-        return false
-      end
-    end
-
     begin
+      now = Time.now.to_i
+
+      unless @error_history.empty?
+        # wait before re-connecting
+        wait = 1 #@retry_wait * (2 ** (@error_history.size-1))
+        if now <= @socket_time + wait
+          sleep(wait)
+          try_connect
+        end
+      end
+
       @socket = @connector.call
       @error_history.clear
       return true
 
+    rescue RetryLimitError => ex
+      raise ex
     rescue
       $stderr.puts "connect failed: #{$!}"
       @error_history << $!
@@ -243,9 +271,10 @@ class Writer
         }
         @pending.clear
         @error_history.clear
+        raise RetryLimitError, "exceed retry limit"
+      else
+        retry
       end
-
-      return false
     end
   end
 
@@ -265,7 +294,7 @@ else
   }
 end
 
-w = Writer.new(tag, connector)
+w = Writer.new(tag, connector, time_as_integer: time_as_integer, retry_limit: retry_limit)
 w.start
 
 case format
@@ -281,8 +310,10 @@ when 'json'
   end
 
 when 'msgpack'
+  require 'fluent/engine'
+
   begin
-    u = MessagePack::Unpacker.new($stdin)
+    u = Fluent::MessagePackFactory.msgpack_unpacker($stdin)
     u.each {|record|
       w.write(record)
     }
@@ -292,8 +323,18 @@ when 'msgpack'
     exit 1
   end
 
+when 'none'
+  begin
+    while line = $stdin.gets
+      record = { message_key => line.chomp }
+      w.write(record)
+    end
+  rescue
+    $stderr.puts $!
+    exit 1
+  end
+
 else
   $stderr.puts "Unknown format '#{format}'"
   exit 1
 end
-

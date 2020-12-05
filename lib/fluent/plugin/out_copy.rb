@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,62 +13,95 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
-module Fluent
-  class CopyOutput < MultiOutput
-    Plugin.register_output('copy', self)
 
-    config_param :deep_copy, :bool, :default => false
+require 'fluent/plugin/multi_output'
+require 'fluent/config/error'
+require 'fluent/event'
+
+module Fluent::Plugin
+  class CopyOutput < MultiOutput
+    Fluent::Plugin.register_output('copy', self)
+
+    desc 'If true, pass different record to each `store` plugin.'
+    config_param :deep_copy, :bool, default: false, deprecated: "use 'copy_mode' parameter instead"
+    desc 'Pass different record to each `store` plugin by specified method'
+    config_param :copy_mode, :enum, list: [:no_copy, :shallow, :deep, :marshal], default: :no_copy
+
+    attr_reader :ignore_errors
 
     def initialize
       super
-      @outputs = []
+      @ignore_errors = []
     end
-
-    attr_reader :outputs
 
     def configure(conf)
       super
-      conf.elements.select {|e|
-        e.name == 'store'
-      }.each {|e|
-        type = e['type']
-        unless type
-          raise ConfigError, "Missing 'type' parameter on <store> directive"
-        end
-        $log.debug "adding store type=#{type.dump}"
 
-        output = Plugin.new_output(type)
-        output.configure(e)
-        @outputs << output
+      @copy_proc = gen_copy_proc
+      @stores.each { |store|
+        @ignore_errors << (store.arg == 'ignore_error')
       }
     end
 
-    def start
-      @outputs.each {|o|
-        o.start
-      }
+    def multi_workers_ready?
+      true
     end
 
-    def shutdown
-      @outputs.each {|o|
-        o.shutdown
-      }
-    end
-
-    def emit(tag, es, chain)
+    def process(tag, es)
       unless es.repeatable?
-        m = MultiEventStream.new
+        m = Fluent::MultiEventStream.new
         es.each {|time,record|
           m.add(time, record)
         }
         es = m
       end
-      if @deep_copy
-        chain = CopyOutputChain.new(@outputs, tag, es, chain)
-      else
-        chain = OutputChain.new(@outputs, tag, es, chain)
+
+      outputs.each_with_index do |output, i|
+        begin
+          output.emit_events(tag, @copy_proc ? @copy_proc.call(es) : es)
+        rescue => e
+          if @ignore_errors[i]
+            log.error "ignore emit error in #{output.plugin_id}", error: e
+          else
+            raise e
+          end
+        end
       end
-      chain.next
+    end
+
+    private
+
+    def gen_copy_proc
+      @copy_mode = :shallow if @deep_copy
+
+      case @copy_mode
+      when :no_copy
+         nil
+      when :shallow
+        Proc.new { |es| es.dup }
+      when :deep
+        Proc.new { |es|
+          packer = Fluent::MessagePackFactory.msgpack_packer
+          times = []
+          records = []
+          es.each { |time, record|
+            times << time
+            packer.pack(record)
+          }
+          Fluent::MessagePackFactory.msgpack_unpacker.feed_each(packer.full_pack) { |record|
+            records << record
+          }
+          Fluent::MultiEventStream.new(times, records)
+        }
+      when :marshal
+        Proc.new { |es|
+          new_es = Fluent::MultiEventStream.new
+          es.each { |time, record|
+            new_es.add(time, Marshal.load(Marshal.dump(record)))
+          }
+          new_es
+        }
+      end
     end
   end
 end

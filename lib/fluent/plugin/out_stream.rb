@@ -1,7 +1,5 @@
 #
-# Fluent
-#
-# Copyright (C) 2011 FURUHASHI Sadayuki
+# Fluentd
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -15,18 +13,22 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
+
+require 'socket'
+require 'fileutils'
+
+require 'fluent/output'
+require 'fluent/event'
+
 module Fluent
   # obsolete
   class StreamOutput < BufferedOutput
-    def initialize
-      require 'socket'
-      require 'fileutils'
-      super
-    end
+    config_param :send_timeout, :time, default: 60
 
-    config_param :send_timeout, :time, :default => 60
+    helpers :compat_parameters
 
     def configure(conf)
+      compat_parameters_convert(conf, :buffer)
       super
     end
 
@@ -66,7 +68,7 @@ module Fluent
         chain = NullOutputChain.instance
         chunk.open {|io|
           # TODO use MessagePackIoEventStream
-          u = MessagePack::Unpacker.new(io)
+          u = Fluent::MessagePackFactory.msgpack_unpacker(io)
           begin
             u.each {|(tag,entries)|
               es = MultiEventStream.new
@@ -86,13 +88,15 @@ module Fluent
   class TcpOutput < StreamOutput
     Plugin.register_output('tcp', self)
 
+    LISTEN_PORT = 24224
+
     def initialize
       super
       $log.warn "'tcp' output is obsoleted and will be removed. Use 'forward' instead."
-      $log.warn "see 'forward' section in http://fluentd.org/doc/plugin.html for the high-availability configuration."
+      $log.warn "see 'forward' section in https://docs.fluentd.org/ for the high-availability configuration."
     end
 
-    config_param :port, :integer, :default => DEFAULT_LISTEN_PORT
+    config_param :port, :integer, default: LISTEN_PORT
     config_param :host, :string
 
     def configure(conf)
